@@ -1,8 +1,9 @@
 # Android Dev Bridge
 
 USB debug proxy for connecting a physical Android device to a local HTTP backend.
-An initial prototype using Python 3 standard library and Android Platform Tools
-(`adb`). No Python packages need to be installed.
+The proxy CLI uses only the Python 3 standard library. The optional stdio MCP
+server uses the official MCP Python SDK and requires Python 3.11+. Android
+Platform Tools (`adb`) are needed to connect a device.
 
 ## How it works
 
@@ -129,6 +130,85 @@ previous proxy setting.
 
 ## Scope
 
-This is a manual debugging prototype. Device setup, backend startup and cleanup
-are manual. It does not provide MCP, automatic recovery, HTTPS interception or
-application-specific instrumentation helpers.
+The CLI and MCP share `bridge.py`; neither changes Android settings. Device
+setup, backend startup and restoration of the global proxy remain manual in this
+version. No automatic recovery, HTTPS interception or application-specific
+instrumentation helpers are included.
+
+Each MCP process owns its own proxy. Tools do not attach to an existing CLI
+process. Stop a CLI proxy before starting an MCP proxy on the same port. On normal
+MCP shutdown or stdin closure, its proxy is stopped. Device settings and ADB
+reverse mappings remain in place until you restore them manually; abrupt process
+termination also requires manual device cleanup.
+
+## MCP setup
+
+Install the SDK in a virtual environment (the CLI still has no dependencies):
+
+```sh
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+```
+
+Alternatively, with uv:
+
+```sh
+uv venv .venv
+uv pip install --python .venv/bin/python -r requirements.txt
+```
+
+Configure your MCP client with absolute paths to this checkout:
+
+```json
+{
+  "mcpServers": {
+    "android-dev-bridge": {
+      "command": "/absolute/path/android-dev-bridge/.venv/bin/python",
+      "args": ["/absolute/path/android-dev-bridge/mcp_server.py"]
+    }
+  }
+}
+```
+
+The MCP transport uses stdio. Proxy events are retained in memory, not printed to
+stdout. No backend or proxy is started during initialization or tools/list.
+For `bridge_devices`, ensure `adb` is on the MCP process's PATH.
+
+| Tool | Purpose |
+| --- | --- |
+| `bridge_devices` | List ADB device serials and authorization state. |
+| `bridge_start` | Start a loopback proxy with `host`, optional `proxy_port`, `backend_port`, `reject_path`. |
+| `bridge_status` | Get the current process's proxy state. |
+| `bridge_set_fault` | Set `reject_path` to inject 503, or null to disable injection. Requires `session_id`. |
+| `bridge_requests` | Read local HTTP metadata with sequence pagination (`after`, `limit`). |
+| `bridge_stop` | Stop the proxy identified by `session_id`. Restore device proxy settings first. |
+
+Responses contain JSON facts, without scenario planning or analysis. A typical
+workflow is:
+
+1. Call `bridge_start` with the application's HTTP hostname and local backend port.
+2. Connect the chosen device manually using the ADB instructions above.
+3. Exercise the app. Read `bridge_requests`; use `bridge_set_fault` when needed.
+4. Restore the original device proxy and remove the created reverse mapping.
+5. Call `bridge_stop` with the `session_id` returned by start.
+
+The journal keeps the last 500 completed local requests in memory. `content_length`
+is the declared request Content-Length (0 when absent), not a measured byte count.
+`status: null` with `error` indicates a forwarding failure. HTTPS tunnels and
+passthrough HTTP requests are not included. A new start clears the journal;
+sequence numbers increase for the lifetime of the process. `truncated` marks a
+cursor older than retained data. No bodies, query strings or header values are
+returned. Faults match all supported HTTP methods at the exact selected path.
+
+## Tests
+
+After installing MCP requirements:
+
+```sh
+.venv/bin/python -m unittest discover -s tests -v
+```
+
+Tests use a local HTTP backend and real stdio MCP transport. They do not change
+Android settings or require a connected device. They cover HTTP body streaming,
+chunked uploads, fault toggling, session identity, bounded request history,
+CLI signals and MCP process-exit cleanup.
